@@ -2,14 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: ['**']
   pull_request:
     branches: [main, master]
   workflow_dispatch:
 
-# Одновременные запуски в одной ветке отменяем — экономим минуты CI
+# Одновременные запуски в одной ветке отменяем — экономим минуты CI.
+# head_ref для PR: иначе push в ветку и PR из неё запускали бы две копии.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
