@@ -9,6 +9,7 @@
 #include "sparkline.hpp"
 #include <string>
 #include <vector>
+#include <atomic>
 #include <unordered_map>
 
 namespace sysflex {
@@ -26,9 +27,21 @@ public:
 private:
     Config config_;
 
-    // Обрабатывает Ctrl+C в --live режиме для корректного завершения
-    static volatile bool running_;
+    // Флаг «продолжать работу», который сбрасывает обработчик сигнала.
+    // Именно std::atomic, а не volatile: обращение к нему происходит из
+    // обработчика сигнала, и только lock-free атомик имеет там гарантированное
+    // поведение (volatile не запрещает компилятору кэшировать значение).
+    static std::atomic<bool> running_;
+    static_assert(std::atomic<bool>::is_always_lock_free,
+                  "std::atomic<bool> обязан быть lock-free для использования в обработчике сигнала");
     static void signalHandler(int signum);
+
+    // Создаёт монитор с настройками из конфигурации
+    [[nodiscard]] SystemMonitor makeMonitor() const;
+
+    // Снимает два замера с небольшой паузой: первый инициализирует счётчики
+    // дельт (CPU/сеть/диск/процессы), второй уже даёт осмысленные скорости.
+    [[nodiscard]] static SystemInfo warmUpSnapshot(SystemMonitor& monitor, int pauseMs);
 
     void runNormal();
     void runLive();
@@ -36,6 +49,7 @@ private:
     void runJson();
     void runGame();
     void runBenchmark();
+    void runListThemes() const;
 
     // Находит и запускает все исполняемые плагины из каталога plugins/,
     // выводя их результат после основной информации.

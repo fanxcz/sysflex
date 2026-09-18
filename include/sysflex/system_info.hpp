@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdint>
 #include <chrono>
+#include <unordered_map>
 
 namespace sysflex {
 
@@ -224,6 +225,14 @@ public:
     // для расчёта дельты требуется минимум два замера.
     SystemInfo update();
 
+    // Задаёт, как часто (в секундах) перечитывать «медленные» данные,
+    // требующие запуска внешних утилит: GPU (nvidia-smi/lspci), docker,
+    // lsusb, bluetoothctl, playerctl, git и `who`. Всё остальное читается
+    // из /proc и /sys и обновляется на каждом снимке. Значение <= 0
+    // отключает кэш (данные перечитываются каждый кадр).
+    void setSlowRefreshSeconds(double seconds) { slowRefreshSec_ = seconds; }
+    [[nodiscard]] double slowRefreshSeconds() const { return slowRefreshSec_; }
+
 private:
     // --- Внутренние методы сбора отдельных категорий данных ---
     void collectCpu(SystemInfo& info);
@@ -250,6 +259,15 @@ private:
     void collectExtras(SystemInfo& info);
     // Сбор второго пакета из 30 метрик (v1.3) — см. комментарий в SystemInfo.
     void collectExtras2(SystemInfo& info);
+
+    // --- Работа с кэшем «медленных» (внешних) данных ---
+    // collectGpu/collectDocker/collectGit/collectMusic/collectUsb/
+    // collectBluetooth/collectUsers вызывают внешние программы, поэтому
+    // выполняются не чаще slowRefreshSec_ раз в секунду; в остальных кадрах
+    // значения берутся из slow_ без единого fork/exec.
+    [[nodiscard]] bool slowCacheStale(const SystemInfo& info) const;
+    void refreshSlowCache(SystemInfo& info);
+    void applySlowCache(SystemInfo& info) const;
 
     // --- Состояние между вызовами (для расчёта дельт) ---
     struct CpuJiffies {
@@ -287,6 +305,28 @@ private:
     bool havePrevPerCore_ = false;
 
     int topProcessCount_ = 5;
+
+    // --- Кэш данных, требующих запуска внешних утилит ---
+    struct SlowCache {
+        bool filled = false;
+        std::chrono::steady_clock::time_point fetchedAt{};
+        std::string gpuModel;
+        double gpuTemperatureC = -1.0;
+        double gpuMemUsedMB = -1.0;
+        double gpuMemTotalMB = -1.0;
+        int dockerContainerCount = -1;
+        std::string gitBranch;
+        std::string musicStatus;
+        std::vector<std::string> usbDevices;
+        std::vector<std::string> bluetoothDevices;
+        int loggedUsersCount = 0;
+    } slow_;
+    double slowRefreshSec_ = 5.0;
+
+    // --- Предыдущие значения utime+stime по PID ---
+    // Нужны, чтобы считать мгновенную загрузку процесса между двумя кадрами,
+    // а не среднюю за всё время его жизни.
+    std::unordered_map<int, long long> prevProcTicks_;
 };
 
 } // namespace sysflex

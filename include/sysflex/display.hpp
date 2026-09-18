@@ -30,9 +30,12 @@ public:
     // Игровой режим: фокус на GPU/CPU/RAM, минимум лишнего
     void printGame(const SystemInfo& info) const;
 
-    // Один "кадр" живого режима: полный дашборд + спарклайны истории
+    // Один "кадр" живого режима: полный дашборд + спарклайны истории.
+    // clearScreen=false нужен при выводе в файл/pipe: экран не очищается,
+    // и кадры просто идут подряд, как обычный лог.
     void printLiveFrame(const SystemInfo& info,
-                         std::unordered_map<std::string, Sparkline>& sparks) const;
+                        std::unordered_map<std::string, Sparkline>& sparks,
+                        bool clearScreen = true) const;
 
     // Отчёт по результатам бенчмарка
     void printBenchmarkResult(double cpuScore, double memScore, double diskScore,

@@ -10,6 +10,7 @@
 #include <thread>
 #include <chrono>
 #include <vector>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <unordered_set>
@@ -20,13 +21,32 @@ namespace sysflex {
 
 using namespace utils;
 
-volatile bool App::running_ = true;
+std::atomic<bool> App::running_{true};
 
 void App::signalHandler(int /*signum*/) {
-    running_ = false;
+    // В обработчике сигнала допустимы только async-signal-safe операции;
+    // relaxed-запись в lock-free атомик к ним относится.
+    running_.store(false, std::memory_order_relaxed);
 }
 
 App::App(const Config& config) : config_(config) {}
+
+// Монитор с параметрами из конфигурации. Интервал обновления «медленных»
+// данных (внешние утилиты) берётся из --slow-refresh / конфиг-файла.
+SystemMonitor App::makeMonitor() const {
+    SystemMonitor monitor(config_.topProcessCount);
+    monitor.setSlowRefreshSeconds(config_.slowRefreshSec);
+    return monitor;
+}
+
+// Два замера с паузой между ними: скорости и мгновенная загрузка процессов
+// считаются как дельта между кадрами, поэтому одиночный update() всегда
+// вернул бы нули.
+SystemInfo App::warmUpSnapshot(SystemMonitor& monitor, int pauseMs) {
+    monitor.update();
+    std::this_thread::sleep_for(std::chrono::milliseconds(pauseMs));
+    return monitor.update();
+}
 
 int App::run() {
     if (config_.showHelp) {
@@ -44,14 +64,28 @@ int App::run() {
     utils::setExecTimeoutSec(config_.execTimeoutSec);
 
     switch (config_.mode) {
-        case Mode::Normal: runNormal(); break;
-        case Mode::Live:   runLive();   break;
-        case Mode::Short:  runShort();  break;
-        case Mode::Json:   runJson();   break;
-        case Mode::Game:   runGame();   break;
-        case Mode::Bench:  runBenchmark(); break;
+        case Mode::Normal:     runNormal();     break;
+        case Mode::Live:       runLive();       break;
+        case Mode::Short:      runShort();      break;
+        case Mode::Json:       runJson();       break;
+        case Mode::Game:       runGame();       break;
+        case Mode::Bench:      runBenchmark();  break;
+        case Mode::ListThemes: runListThemes(); break;
     }
     return 0;
+}
+
+// ------------------------------------------------------------------
+// Список доступных тем
+// ------------------------------------------------------------------
+void App::runListThemes() const {
+    std::cout << "Доступные темы sysflex:\n";
+    for (const std::string& name : themeNames()) {
+        const Theme t = getTheme(name, config_.noColor);
+        std::cout << "  " << t.primary << t.bold << name << t.reset
+                  << (name == config_.theme ? "  (текущая)" : "") << "\n";
+    }
+    std::cout << "\nПрименить тему: sysflex --theme NAME\n";
 }
 
 // ------------------------------------------------------------------
@@ -59,13 +93,8 @@ int App::run() {
 // ------------------------------------------------------------------
 void App::runNormal() {
     Theme theme = getTheme(config_.theme, config_.noColor);
-    SystemMonitor monitor(config_.topProcessCount);
-
-    // Первый замер нужен для инициализации счётчиков дельт (сеть/диск/CPU),
-    // делаем небольшую паузу и снимаем второй, уже информативный снимок.
-    monitor.update();
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    SystemInfo info = monitor.update();
+    SystemMonitor monitor = makeMonitor();
+    SystemInfo info = warmUpSnapshot(monitor, 300);
 
     Display display(theme, config_.noAscii);
     display.printFull(info);
@@ -78,10 +107,8 @@ void App::runNormal() {
 // ------------------------------------------------------------------
 void App::runShort() {
     Theme theme = getTheme(config_.theme, config_.noColor);
-    SystemMonitor monitor(config_.topProcessCount);
-    monitor.update();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    SystemInfo info = monitor.update();
+    SystemMonitor monitor = makeMonitor();
+    SystemInfo info = warmUpSnapshot(monitor, 200);
 
     Display display(theme, config_.noAscii);
     display.printShort(info);
@@ -92,10 +119,8 @@ void App::runShort() {
 // ------------------------------------------------------------------
 void App::runJson() {
     Theme theme = getTheme(config_.theme, true); // JSON всегда без цветов
-    SystemMonitor monitor(config_.topProcessCount);
-    monitor.update();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    SystemInfo info = monitor.update();
+    SystemMonitor monitor = makeMonitor();
+    SystemInfo info = warmUpSnapshot(monitor, 200);
 
     Display display(theme, config_.noAscii);
     display.printJson(info);
@@ -106,10 +131,8 @@ void App::runJson() {
 // ------------------------------------------------------------------
 void App::runGame() {
     Theme theme = getTheme(config_.theme, config_.noColor);
-    SystemMonitor monitor(config_.topProcessCount);
-    monitor.update();
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    SystemInfo info = monitor.update();
+    SystemMonitor monitor = makeMonitor();
+    SystemInfo info = warmUpSnapshot(monitor, 300);
 
     Display display(theme, config_.noAscii);
     display.printGame(info);
@@ -119,11 +142,21 @@ void App::runGame() {
 // Живой режим со спарклайнами (обновляется в цикле до Ctrl+C)
 // ------------------------------------------------------------------
 void App::runLive() {
+    // Ctrl+C, kill и закрытие терминала должны завершать sysflex аккуратно.
     std::signal(SIGINT, App::signalHandler);
     std::signal(SIGTERM, App::signalHandler);
+    std::signal(SIGHUP, App::signalHandler);
+    std::signal(SIGQUIT, App::signalHandler);
+    // При выводе в pipe (sysflex | head) закрытие читателя не должно убивать
+    // процесс сигналом — просто завершим цикл по ошибке записи.
+    std::signal(SIGPIPE, SIG_IGN);
+
+    // Экран перерисовывается и курсор прячется только в настоящем терминале:
+    // при перенаправлении в файл или pipe escape-коды превратили бы лог в мусор.
+    const bool interactive = isatty(STDOUT_FILENO) == 1;
 
     Theme theme = getTheme(config_.theme, config_.noColor);
-    SystemMonitor monitor(config_.topProcessCount);
+    SystemMonitor monitor = makeMonitor();
     Display display(theme, config_.noAscii);
 
     std::unordered_map<std::string, Sparkline> sparks;
@@ -133,22 +166,30 @@ void App::runLive() {
 
     monitor.update(); // инициализация счётчиков дельт
 
-    while (running_) {
+    if (interactive) std::cout << "\033[?25l"; // спрятать курсор
+    std::cout.flush();
+
+    while (running_.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         SystemInfo info = monitor.update();
-        display.printLiveFrame(info, sparks);
+        display.printLiveFrame(info, sparks, interactive);
+        if (std::cout.fail()) break; // читатель закрыл pipe — дальше писать некуда
 
         // Ждём оставшуюся часть интервала, но проверяем флаг running_ почаще,
         // чтобы Ctrl+C сработал быстро, а не только в конце длинного sleep.
         int waited = 0;
         int totalMs = std::max(0, config_.interval * 1000 - 200);
-        while (waited < totalMs && running_) {
+        while (waited < totalMs && running_.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             waited += 100;
         }
     }
 
-    std::cout << "\n" << "sysflex: живой режим остановлен.\n";
+    // Возвращаем терминал в пригодное состояние: показываем курсор и
+    // очищаем кадр, иначе последние цифры останутся «висеть» в консоли.
+    if (interactive) std::cout << "\033[2J\033[H\033[?25h";
+    std::cout << "sysflex: живой режим остановлен.\n";
+    std::cout.flush();
 }
 
 // ------------------------------------------------------------------
@@ -176,8 +217,10 @@ void App::runBenchmark() {
     }
     // Нормируем к условным "баллам": миллион итераций/сек ~ 100 баллов
     double cpuScore = static_cast<double>(cpuIterations) / 1'000'000.0 * 100.0;
-    // Небольшая защита, чтобы компилятор не выкинул "мёртвый" код
-    if (cpuAccumulator == 123456.789) std::cout << "";
+    // Запись в volatile не даёт оптимизатору выкинуть весь «бесполезный»
+    // расчёт вместе с циклом (иначе бенчмарк измерял бы пустоту).
+    volatile double benchmarkSink = cpuAccumulator;
+    (void)benchmarkSink;
 
     // --- Тест памяти: аллоцируем буфер и многократно копируем его ---
     std::cout << theme.muted << "  [2/3] Тестирование памяти..." << theme.reset << std::endl;
@@ -244,11 +287,17 @@ void App::runBenchmark() {
 // Система плагинов
 // ------------------------------------------------------------------
 std::vector<std::string> App::findPluginPaths() const {
-    std::vector<std::string> candidates = {
-        "./plugins",
-        "/usr/local/share/sysflex/plugins",
-        "/usr/share/sysflex/plugins",
-    };
+    std::vector<std::string> candidates;
+
+    // Каталог, заданный пользователем, имеет наивысший приоритет: при
+    // совпадении имён побеждает именно он (см. дедупликацию в runPlugins()).
+    if (const char* envDir = std::getenv("SYSFLEX_PLUGINS_DIR")) {
+        if (*envDir != '\0') candidates.push_back(envDir);
+    }
+    candidates.push_back("./plugins");
+    candidates.push_back("/usr/local/share/sysflex/plugins");
+    candidates.push_back("/usr/share/sysflex/plugins");
+
     const char* home = std::getenv("HOME");
     if (home) {
         candidates.push_back(std::string(home) + "/.sysflex/plugins");
@@ -259,7 +308,11 @@ std::vector<std::string> App::findPluginPaths() const {
     for (auto& dir : candidates) {
         struct stat st{};
         if (stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-            found.push_back(dir);
+            // Один и тот же каталог может попасть в список дважды
+            // (например, через $SYSFLEX_PLUGINS_DIR и как ./plugins).
+            if (std::find(found.begin(), found.end(), dir) == found.end()) {
+                found.push_back(dir);
+            }
         }
     }
     return found;
@@ -274,29 +327,30 @@ void App::runPlugins() const {
     // sysflex работал как из папки с исходниками, так и после `install.sh`.
     // Но если один и тот же плагин лежит одновременно в нескольких из этих
     // каталогов (например, install.sh скопировал его, а исходная папка
-    //plugins/ всё ещё рядом), раньше он запускался и выводился по разу на
-    // каждый найденный каталог. Теперь дедуплицируем по имени файла:
-    // побеждает каталог с более высоким приоритетом (первый в списке
-    // findPluginPaths()), остальные одноимённые плагины пропускаются.
+    // plugins/ всё ещё рядом), раньше он запускался и выводился по разу на
+    // каждый найденный каталог. Дедуплицируем по имени файла: побеждает
+    // каталог с более высоким приоритетом (первый в списке findPluginPaths()).
     auto dirs = findPluginPaths();
     std::unordered_set<std::string> seenNames;
     for (auto& dir : dirs) {
-        std::string listCmd = "find \"" + dir + "\" -maxdepth 1 -type f -perm -u+x 2>/dev/null";
-        std::string listing = execCommand(listCmd);
-        auto files = split(listing, '\n');
-        for (auto& file : files) {
-            std::string path = trim(file);
-            if (path.empty()) continue;
+        // Каталог перебирается системными вызовами, без запуска `find` через
+        // shell: плагины и так являются внешними процессами, плодить лишние
+        // не имеет смысла.
+        std::vector<std::string> files = listDirectory(dir);
+        std::sort(files.begin(), files.end()); // детерминированный порядок вывода
+        for (const std::string& file : files) {
+            const std::string path = dir + "/" + file;
 
-            auto slashPos = path.find_last_of('/');
-            std::string name = (slashPos != std::string::npos) ? path.substr(slashPos + 1) : path;
+            struct stat st{};
+            if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+            if (access(path.c_str(), X_OK) != 0) continue; // не исполняемый — не плагин
 
-            if (!seenNames.insert(name).second) {
+            if (!seenNames.insert(file).second) {
                 continue; // плагин с таким именем уже был запущен из другого каталога
             }
 
             std::string output = execCommand(path);
-            display.printPluginOutput(name, output);
+            display.printPluginOutput(file, output);
         }
     }
 }

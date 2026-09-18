@@ -1,0 +1,20 @@
+# .clang-format — стиль оформления кода sysflex.
+# Соответствует уже существующему коду: 4 пробела, скобка K&R, ширина 120.
+# Применять вручную: clang-format -i src/*.cpp include/sysflex/*.hpp
+BasedOnStyle: LLVM
+Standard: c++17
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+BreakBeforeBraces: Attach
+AccessModifierOffset: -4
+NamespaceIndentation: None
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+PointerAlignment: Left
+SpaceBeforeParens: ControlStatements
+SortIncludes: false
+ReflowComments: true
+AlignTrailingComments: true
