@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <thread>
 #include <map>
+#include <unordered_set>
+#include <limits.h>
 
 namespace sysflex {
 
@@ -25,27 +27,30 @@ SystemInfo SystemMonitor::update() {
     SystemInfo info;
     info.timestamp = std::chrono::steady_clock::now();
 
+    // --- Быстрые источники: /proc, /sys, statvfs. Ни одного fork/exec. ---
     collectCpu(info);
     collectMemory(info);
     collectSwap(info);
     collectDisk(info);
     collectNetwork(info);
-    collectGpu(info);
     collectBattery(info);
     collectUptime(info);
     collectProcesses(info);
     collectShellTerminal(info);
     collectOsKernelHost(info);
-    collectDocker(info);
-    collectGit(info);
-    collectMusic(info);
-    collectUsb(info);
-    collectBluetooth(info);
     collectInodes(info);
-    collectUsers(info);
     collectTime(info);
     collectExtras(info);
     collectExtras2(info);
+
+    // --- Медленные источники: внешние утилиты (nvidia-smi, docker, lsusb,
+    // bluetoothctl, playerctl, git, who). Обновляются не чаще одного раза в
+    // slowRefreshSec_ секунд, между обновлениями отдаётся кэш. ---
+    if (slowCacheStale(info)) {
+        refreshSlowCache(info);
+    }
+    applySlowCache(info);
+
     computeHealthScore(info);
 
     prevTimestamp_ = info.timestamp;
@@ -53,6 +58,97 @@ SystemInfo SystemMonitor::update() {
 
     return info;
 }
+
+// ------------------------------------------------------------------
+// Кэш «медленных» данных: что перечитывать, а что взять из кэша
+// ------------------------------------------------------------------
+bool SystemMonitor::slowCacheStale(const SystemInfo& info) const {
+    if (!slow_.filled) return true;
+    if (slowRefreshSec_ <= 0.0) return true; // кэш отключён
+    const double age = std::chrono::duration<double>(info.timestamp - slow_.fetchedAt).count();
+    return age >= slowRefreshSec_;
+}
+
+void SystemMonitor::refreshSlowCache(SystemInfo& info) {
+    collectGpu(info);
+    collectDocker(info);
+    collectGit(info);
+    collectMusic(info);
+    collectUsb(info);
+    collectBluetooth(info);
+    collectUsers(info);
+
+    slow_.gpuModel = info.gpuModel;
+    slow_.gpuTemperatureC = info.gpuTemperatureC;
+    slow_.gpuMemUsedMB = info.gpuMemUsedMB;
+    slow_.gpuMemTotalMB = info.gpuMemTotalMB;
+    slow_.dockerContainerCount = info.dockerContainerCount;
+    slow_.gitBranch = info.gitBranch;
+    slow_.musicStatus = info.musicStatus;
+    slow_.usbDevices = info.usbDevices;
+    slow_.bluetoothDevices = info.bluetoothDevices;
+    slow_.loggedUsersCount = info.loggedUsersCount;
+    slow_.fetchedAt = info.timestamp;
+    slow_.filled = true;
+}
+
+void SystemMonitor::applySlowCache(SystemInfo& info) const {
+    if (!slow_.filled) return;
+    info.gpuModel = slow_.gpuModel;
+    info.gpuTemperatureC = slow_.gpuTemperatureC;
+    info.gpuMemUsedMB = slow_.gpuMemUsedMB;
+    info.gpuMemTotalMB = slow_.gpuMemTotalMB;
+    info.dockerContainerCount = slow_.dockerContainerCount;
+    info.gitBranch = slow_.gitBranch;
+    info.musicStatus = slow_.musicStatus;
+    info.usbDevices = slow_.usbDevices;
+    info.usbDeviceCount = static_cast<int>(slow_.usbDevices.size());
+    info.bluetoothDevices = slow_.bluetoothDevices;
+    info.bluetoothDeviceCount = static_cast<int>(slow_.bluetoothDevices.size());
+    info.loggedUsersCount = slow_.loggedUsersCount;
+}
+
+// ------------------------------------------------------------------
+// Фильтр записей /proc/diskstats: только «целые» устройства
+// ------------------------------------------------------------------
+namespace {
+
+// Список «целых» блочных устройств из /sys/block: ядро держит там только
+// сами устройства, а разделы лежат в их подкаталогах (sda/sda1, nvme0n1/
+// nvme0n1p1). Это надёжнее угадывания по имени — прежняя эвристика «есть
+// цифры => это раздел» целиком отбрасывала mmcblk0 (eMMC) и md0.
+std::unordered_set<std::string> readWholeBlockDevices() {
+    std::unordered_set<std::string> devices;
+    static const char* skipPrefixes[] = {"loop", "ram", "zram", "dm-", "sr", "fd"};
+    for (const std::string& name : utils::listDirectory("/sys/block")) {
+        bool skip = false;
+        for (const char* prefix : skipPrefixes) {
+            if (utils::startsWith(name, prefix)) { skip = true; break; }
+        }
+        if (!skip) devices.insert(name);
+    }
+    return devices;
+}
+
+// Запасная эвристика на случай, если /sys/block недоступен (контейнер).
+bool looksLikeWholeDevice(const std::string& devName) {
+    if (devName.empty()) return false;
+    if (utils::startsWith(devName, "loop") || utils::startsWith(devName, "ram") ||
+        utils::startsWith(devName, "dm-")) {
+        return false;
+    }
+    if (utils::startsWith(devName, "nvme") || utils::startsWith(devName, "mmcblk")) {
+        return devName.find('p') == std::string::npos; // nvme0n1 — целое, nvme0n1p1 — раздел
+    }
+    return !std::isdigit(static_cast<unsigned char>(devName.back()));
+}
+
+bool isWholeDiskEntry(const std::unordered_set<std::string>& whole, const std::string& devName) {
+    if (!whole.empty()) return whole.count(devName) > 0;
+    return looksLikeWholeDevice(devName);
+}
+
+} // namespace
 
 // ------------------------------------------------------------------
 // 1. CPU: загрузка, частота, температура, load average, ядра
@@ -217,22 +313,14 @@ void SystemMonitor::collectDisk(SystemInfo& info) {
     std::ifstream diskstats("/proc/diskstats");
     std::string line;
     uint64_t readSectors = 0, writeSectors = 0;
+    const auto wholeDevices = readWholeBlockDevices();
     while (std::getline(diskstats, line)) {
         auto f = splitWs(line);
         if (f.size() < 14) continue;
         const std::string& devName = f[2];
-        // Пропускаем разделы (sda1, nvme0n1p1) и виртуальные loop/ram устройства,
-        // считаем только "целые" диски, чтобы не удваивать статистику.
-        bool isPartition = false;
-        if (startsWith(devName, "loop") || startsWith(devName, "ram") || startsWith(devName, "dm-")) continue;
-        for (char c : devName) {
-            if (std::isdigit(static_cast<unsigned char>(c))) { isPartition = true; break; }
-        }
-        if (startsWith(devName, "nvme")) {
-            // nvme0n1 — не раздел, nvme0n1p1 — раздел (содержит 'p')
-            isPartition = devName.find('p') != std::string::npos;
-        }
-        if (isPartition) continue;
+        // Считаем только «целые» диски, а не их разделы, иначе байты и
+        // операции учитываются дважды (устройство + его разделы).
+        if (!isWholeDiskEntry(wholeDevices, devName)) continue;
 
         readSectors += toLong(f[5]);
         writeSectors += toLong(f[9]);
@@ -387,8 +475,22 @@ void SystemMonitor::collectProcesses(SystemInfo& info) {
     std::vector<ProcessInfo> all;
     int count = 0;
 
-    long clockTicks = sysconf(_SC_CLK_TCK);
-    long totalMemKB = static_cast<long>(info.ramTotalKB);
+    const long clockTicks = sysconf(_SC_CLK_TCK);
+    const double ticksPerSec = static_cast<double>(clockTicks > 0 ? clockTicks : 100);
+    const long totalMemKB = static_cast<long>(info.ramTotalKB);
+    const long pageSizeKB = sysconf(_SC_PAGESIZE) / 1024;
+
+    // Интервал между этим и предыдущим кадром — по нему считаем мгновенную
+    // загрузку процесса. На первом кадре дельты нет, поэтому там остаётся
+    // запасной вариант (средняя загрузка за время жизни процесса).
+    const double dt = havePrevTimestamp_
+        ? std::chrono::duration<double>(info.timestamp - prevTimestamp_).count()
+        : 0.0;
+    // Многопоточный процесс может занимать больше 100% одного ядра.
+    unsigned int hwCores = std::thread::hardware_concurrency();
+    const double maxPercent = 100.0 * static_cast<double>(hwCores > 0 ? hwCores : 1);
+
+    std::unordered_map<int, long long> currentTicks;
 
     while ((entry = readdir(dir)) != nullptr) {
         std::string name = entry->d_name;
@@ -413,20 +515,25 @@ void SystemMonitor::collectProcesses(SystemInfo& info) {
         long utime = toLong(fields[11]);
         long stime = toLong(fields[12]);
         long totalTimeTicks = utime + stime;
-        double seconds = static_cast<double>(totalTimeTicks) / static_cast<double>(clockTicks > 0 ? clockTicks : 100);
+        double seconds = static_cast<double>(totalTimeTicks) / ticksPerSec;
 
-        // Приблизительная оценка % CPU: время процесса относительно аптайма.
-        // Это не мгновенная загрузка, а средняя за время жизни процесса —
-        // такого простого и надёжного способа без второго замера достаточно
-        // для отображения "тяжёлых" процессов.
+        // Мгновенная загрузка: сколько процессного времени процесс потратил
+        // между двумя кадрами. Раньше здесь считалось отношение к аптайму,
+        // из-за чего в топе висели давно отработавшие процессы, а реально
+        // нагруженный прямо сейчас мог вообще не попасть в список.
         double cpuPercent = 0.0;
-        if (info.uptimeSeconds > 0) {
-            cpuPercent = 100.0 * seconds / static_cast<double>(info.uptimeSeconds);
+        auto prev = prevProcTicks_.find(pid);
+        if (prev != prevProcTicks_.end() && dt > 0.0) {
+            double deltaTicks = static_cast<double>(totalTimeTicks - prev->second);
+            if (deltaTicks < 0.0) deltaTicks = 0.0; // PID был переиспользован
+            cpuPercent = std::clamp(100.0 * deltaTicks / ticksPerSec / dt, 0.0, maxPercent);
+        } else if (info.uptimeSeconds > 0) {
+            // Запасной вариант для первого кадра — средняя за время жизни.
+            cpuPercent = std::clamp(100.0 * seconds / static_cast<double>(info.uptimeSeconds), 0.0, maxPercent);
         }
 
         // RSS в страницах памяти — 24-е поле от начала (fields[21])
         long rssPages = toLong(fields[21]);
-        long pageSizeKB = sysconf(_SC_PAGESIZE) / 1024;
         double memPercent = 0.0;
         if (totalMemKB > 0) {
             memPercent = 100.0 * static_cast<double>(rssPages * pageSizeKB) / static_cast<double>(totalMemKB);
@@ -438,9 +545,12 @@ void SystemMonitor::collectProcesses(SystemInfo& info) {
         p.cpuPercent = cpuPercent;
         p.memPercent = memPercent;
         all.push_back(p);
+
+        currentTicks.emplace(pid, totalTimeTicks);
     }
     closedir(dir);
 
+    prevProcTicks_ = std::move(currentTicks);
     info.processCount = count;
 
     std::sort(all.begin(), all.end(), [](const ProcessInfo& a, const ProcessInfo& b) {
@@ -770,17 +880,12 @@ void SystemMonitor::collectExtras(SystemInfo& info) {
         std::ifstream diskstats("/proc/diskstats");
         std::string line;
         uint64_t readOps = 0, writeOps = 0;
+        const auto wholeDevices = readWholeBlockDevices();
         while (std::getline(diskstats, line)) {
             auto f = splitWs(line);
             if (f.size() < 14) continue;
             const std::string& devName = f[2];
-            if (startsWith(devName, "loop") || startsWith(devName, "ram") || startsWith(devName, "dm-")) continue;
-            bool isPartition = false;
-            for (char c : devName) {
-                if (std::isdigit(static_cast<unsigned char>(c))) { isPartition = true; break; }
-            }
-            if (startsWith(devName, "nvme")) isPartition = devName.find('p') != std::string::npos;
-            if (isPartition) continue;
+            if (!isWholeDiskEntry(wholeDevices, devName)) continue;
             readOps += static_cast<uint64_t>(toLong(f[3]));
             writeOps += static_cast<uint64_t>(toLong(f[7]));
         }
@@ -922,11 +1027,17 @@ void SystemMonitor::collectExtras(SystemInfo& info) {
         std::string tz = readFile("/etc/timezone");
         tz = trim(tz);
         if (tz.empty()) {
-            // Fallback: разбираем symlink /etc/localtime вида .../zoneinfo/Europe/Madrid
-            std::string link = execCommand("readlink -f /etc/localtime", 1);
-            link = trim(link);
-            auto pos = link.find("zoneinfo/");
-            if (pos != std::string::npos) tz = link.substr(pos + 9);
+            // Fallback: разбираем symlink /etc/localtime вида .../zoneinfo/Europe/Madrid.
+            // Читаем ссылку системным вызовом readlink(2) — раньше здесь
+            // запускался `readlink -f` через shell на каждом кадре.
+            char buf[PATH_MAX] = {0};
+            ssize_t len = readlink("/etc/localtime", buf, sizeof(buf) - 1);
+            if (len > 0) {
+                buf[len] = '\0';
+                std::string link(buf);
+                auto pos = link.find("zoneinfo/");
+                if (pos != std::string::npos) tz = link.substr(pos + 9);
+            }
         }
         info.systemTimezone = tz.empty() ? "UTC" : tz;
     }
@@ -1039,17 +1150,12 @@ void SystemMonitor::collectExtras2(SystemInfo& info) {
         std::string line;
         int inFlight = 0, deviceCount = 0;
         uint64_t readSectorsTotal = 0, writeSectorsTotal = 0, ioTimeMsTotal = 0;
+        const auto wholeDevices = readWholeBlockDevices();
         while (std::getline(diskstats, line)) {
             auto f = splitWs(line);
             if (f.size() < 14) continue;
             const std::string& devName = f[2];
-            if (startsWith(devName, "loop") || startsWith(devName, "ram") || startsWith(devName, "dm-")) continue;
-            bool isPartition = false;
-            for (char c : devName) {
-                if (std::isdigit(static_cast<unsigned char>(c))) { isPartition = true; break; }
-            }
-            if (startsWith(devName, "nvme")) isPartition = devName.find('p') != std::string::npos;
-            if (isPartition) continue;
+            if (!isWholeDiskEntry(wholeDevices, devName)) continue;
 
             ++deviceCount;
             readSectorsTotal += static_cast<uint64_t>(toLong(f[5]));
@@ -1113,7 +1219,9 @@ void SystemMonitor::collectExtras2(SystemInfo& info) {
             auto f = splitWs(line);
             if (f.size() < 3) continue;
             if (f[1] == "00000000") { // Destination 0.0.0.0 = маршрут по умолчанию
-                unsigned long gwHex = static_cast<unsigned long>(std::stoul(f[2], nullptr, 16));
+                // Именно безопасный парсинг: std::stoul на нечисловом поле
+                // бросил бы std::invalid_argument и аварийно завершил sysflex.
+                unsigned long gwHex = toULong(f[2], 0, 16);
                 // Байты в /proc/net/route хранятся в little-endian
                 std::ostringstream oss;
                 oss << ((gwHex >> 0) & 0xFF) << "." << ((gwHex >> 8) & 0xFF) << "."

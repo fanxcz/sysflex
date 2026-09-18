@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# Одновременные запуски в одной ветке отменяем — экономим минуты CI.
+# head_ref для PR: иначе push в ветку и PR из неё запускали бы две копии.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Release, Debug]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка зависимостей
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang
+
+      - name: Настройка CMake
+        env:
+          CC: ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }}
+          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DSYSFLEX_WERROR=ON
+
+      - name: Сборка
+        run: cmake --build build --verbose
+
+      - name: Модульные тесты (ctest)
+        working-directory: build
+        run: ctest --output-on-failure
+
+      - name: Дымовые тесты бинарного файла
+        run: |
+          set -euo pipefail
+          ./build/sysflex --version
+          ./build/sysflex --version | grep -q '2\.1\.0'
+          ./build/sysflex --help | grep -q 'Использование'
+          ./build/sysflex --list-themes | grep -q 'dracula'
+
+          # Все режимы обязаны завершаться с кодом 0
+          ./build/sysflex --once --no-plugins --no-color --no-ascii > /dev/null
+          ./build/sysflex --once --short --no-plugins --no-color
+          ./build/sysflex --once --game --no-plugins --no-color > /dev/null
+
+          # JSON обязан быть валидным документом (проверяется штатным парсером)
+          ./build/sysflex --once --json --no-plugins > status.json
+          python3 -m json.tool status.json > /dev/null
+          python3 -c "import json;d=json.load(open('status.json'));assert d['version']=='2.1.0'"
+
+          # Неизвестная тема — предупреждение в stderr, но не падение
+          ./build/sysflex --once --short --theme no-such-theme --no-plugins 2>err.log
+          grep -q 'неизвестная тема' err.log
+
+          # Неизвестная опция — ненулевой код возврата
+          if ./build/sysflex --definitely-not-a-flag >/dev/null 2>&1; then
+            echo "ожидался ненулевой код возврата для неизвестной опции" >&2
+            exit 1
+          fi
+
+  # Отдельная проверка, что проект собирается без CMake — это заявлено в README
+  build-without-cmake:
+    name: Сборка через Makefile (без CMake)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make + make test
+        run: |
+          make
+          make test
+          ./sysflex --once --short --no-plugins --no-color
+
+  shellcheck:
+    name: shellcheck для скриптов и плагинов
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Установка shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Проверка
+        run: shellcheck install.sh uninstall.sh plugins/*.sh

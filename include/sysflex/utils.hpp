@@ -15,6 +15,8 @@
 #include <chrono>
 #include <cctype>
 #include <ctime>
+#include <unordered_map>
+#include <dirent.h>
 
 namespace sysflex::utils {
 
@@ -49,6 +51,28 @@ inline std::vector<std::string> splitWs(const std::string& s) {
 // Проверяет, начинается ли строка с заданного префикса
 inline bool startsWith(const std::string& s, const std::string& prefix) {
     return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+// Проверяет, заканчивается ли строка заданным суффиксом
+inline bool endsWith(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// Возвращает имена записей в каталоге (без "." и "..").
+// Единая точка работы с opendir/readdir: при ошибке возвращает пустой список,
+// так что вызывающему коду не нужно проверять nullptr и закрывать каталог.
+inline std::vector<std::string> listDirectory(const std::string& path) {
+    std::vector<std::string> entries;
+    DIR* dir = opendir(path.c_str());
+    if (!dir) return entries;
+    while (struct dirent* entry = readdir(dir)) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        entries.push_back(name);
+    }
+    closedir(dir);
+    return entries;
 }
 
 // Форматирует количество байт в человекочитаемый вид (КБ, МБ, ГБ, ТБ)
@@ -159,9 +183,20 @@ inline std::string execCommand(const std::string& cmd, int timeoutSec = -1) {
 // Проверяет наличие исполняемого файла в PATH (аналог `command -v`).
 // Использует rawExec напрямую (без таймаута) — `command -v` является
 // встроенной командой shell и не может зависнуть.
+//
+// Результат кэшируется на всё время работы процесса: набор утилит в PATH за
+// время жизни sysflex практически не меняется, а каждый вызов `command -v` —
+// это fork+exec /bin/sh (~1 мс). В живом режиме update() вызывается каждую
+// секунду и раньше платил эту цену по 7 раз за кадр.
 inline bool commandExists(const std::string& name) {
+    static std::unordered_map<std::string, bool> cache;
+    auto it = cache.find(name);
+    if (it != cache.end()) return it->second;
+
     std::string out = rawExec("command -v " + name + " 2>/dev/null");
-    return !trim(out).empty();
+    bool exists = !trim(out).empty();
+    cache.emplace(name, exists);
+    return exists;
 }
 
 // Читает содержимое файла целиком в строку. Возвращает пустую строку при ошибке.
@@ -201,6 +236,21 @@ inline double toDouble(const std::string& s, double def = 0.0) {
 inline long toLong(const std::string& s, long def = 0) {
     try {
         return std::stol(s);
+    } catch (...) {
+        return def;
+    }
+}
+
+// Безопасное преобразование строки в unsigned long.
+// В отличие от std::stoul() не бросает исключение на мусорных данных: поля
+// /proc/*/ и /sys/*/ читаются без доверия к их содержимому, и необработанное
+// исключение std::invalid_argument завершило бы sysflex аварийно.
+inline unsigned long toULong(const std::string& s, unsigned long def = 0, int base = 0) {
+    try {
+        size_t pos = 0;
+        unsigned long value = std::stoul(s, &pos, base); // base 0: автоопределение 0x/0
+        if (pos == 0) return def;                        // ни одного символа не разобрано
+        return value;
     } catch (...) {
         return def;
     }
@@ -246,28 +296,71 @@ inline std::string toLowerStr(std::string s) {
     return s;
 }
 
-// Экранирует спецсимволы для корректного вывода строки в JSON
+// Экранирует спецсимволы для корректного вывода строки в JSON.
+// Дополнительно проверяет корректность UTF-8: имена процессов и hostname
+// приходят из ядра и могут содержать "сырые" байты, а невалидный UTF-8
+// ломает любой JSON-парсер. Такие байты заменяются на U+FFFD.
 inline std::string jsonEscape(const std::string& s) {
     std::string out;
     out.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out += buf;
-                } else {
-                    out += c;
-                }
+    const size_t n = s.size();
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            switch (c) {
+                case '"': out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                case '\b': out += "\\b"; break;
+                case '\f': out += "\\f"; break;
+                default:
+                    if (c < 0x20) {
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                        out += buf;
+                    } else {
+                        out += static_cast<char>(c);
+                    }
+            }
+            ++i;
+            continue;
+        }
+
+        // Стартовый байт многобайтовой последовательности: проверяем, что
+        // заявленное число continuation-байтов действительно на месте.
+        int extra = -1;
+        if ((c & 0xE0) == 0xC0) extra = 1;
+        else if ((c & 0xF0) == 0xE0) extra = 2;
+        else if ((c & 0xF8) == 0xF0) extra = 3;
+
+        bool valid = extra > 0 && i + static_cast<size_t>(extra) < n;
+        for (int k = 1; valid && k <= extra; ++k) {
+            if ((static_cast<unsigned char>(s[i + static_cast<size_t>(k)]) & 0xC0) != 0x80) valid = false;
+        }
+        if (valid) {
+            out.append(s, i, static_cast<size_t>(extra) + 1);
+            i += static_cast<size_t>(extra) + 1;
+        } else {
+            out += "\xEF\xBF\xBD"; // U+FFFD REPLACEMENT CHARACTER
+            ++i;
         }
     }
     return out;
+}
+
+// Печатает число так, чтобы результат всегда был валидным JSON-числом.
+// JSON не знает NaN и Infinity, а std::ostream по умолчанию выводит их как
+// "nan"/"inf" — такой документ не распарсится ни одним инструментом.
+// Такие значения заменяются на 0.
+inline std::string jsonNumber(double value, int precision = 4) {
+    if (!std::isfinite(value)) return "0";
+    std::ostringstream oss;
+    oss.precision(precision);
+    oss << std::fixed << value;
+    return oss.str();
 }
 
 } // namespace sysflex::utils

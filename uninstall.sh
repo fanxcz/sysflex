@@ -14,6 +14,7 @@ error() { echo -e "${C_RED}[uninstall]${C_RESET} $1" >&2; }
 PREFIX="${PREFIX:-/usr/local}"
 BIN_PATH="$PREFIX/bin/sysflex"
 PLUGIN_DIR="$PREFIX/share/sysflex"
+MAN_PATH="$PREFIX/share/man/man1/sysflex.1"
 
 remove_path() {
     local path="$1"
@@ -27,12 +28,13 @@ remove_path() {
     fi
 }
 
-if [ ! -e "$BIN_PATH" ] && [ ! -e "$PLUGIN_DIR" ]; then
+if [ ! -e "$BIN_PATH" ] && [ ! -e "$PLUGIN_DIR" ] && [ ! -e "$MAN_PATH" ]; then
     error "sysflex не найден в $PREFIX. Возможно, он установлен в другой каталог (укажите PREFIX=... uninstall.sh)."
     exit 1
 fi
 
 remove_path "$BIN_PATH"
 remove_path "$PLUGIN_DIR"
+remove_path "$MAN_PATH"
 
 info "sysflex успешно удалён из системы."

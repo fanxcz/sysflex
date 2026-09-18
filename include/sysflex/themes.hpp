@@ -4,6 +4,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <unordered_map>
 #include <algorithm>
 #include <cctype>
@@ -119,6 +120,20 @@ inline const std::unordered_map<std::string, Theme>& allThemes() {
         }},
     };
     return themes;
+}
+
+// Проверяет, существует ли тема с таким именем (регистронезависимо)
+inline bool isKnownTheme(const std::string& name) {
+    return allThemes().count(utils::toLowerStr(name)) > 0;
+}
+
+// Возвращает имена всех тем в алфавитном порядке — для --list-themes и справки
+inline std::vector<std::string> themeNames() {
+    std::vector<std::string> names;
+    names.reserve(allThemes().size());
+    for (const auto& entry : allThemes()) names.push_back(entry.first);
+    std::sort(names.begin(), names.end());
+    return names;
 }
 
 // Возвращает тему по имени; если тема не найдена — возвращает default с предупреждением
